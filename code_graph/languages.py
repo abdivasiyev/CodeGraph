@@ -16,6 +16,8 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".go": "go",
     ".dart": "dart",
     ".cs": "csharp",
+    ".hs": "haskell",
+    ".nix": "nix",
 }
 
 # ── Tree-sitter node type mappings per language ──────────────────────────────
@@ -103,6 +105,39 @@ LANGUAGE_MAPPINGS: dict[str, dict[str, list[str]]] = {
         "variable": ["field_declaration", "property_declaration"],
         "string": ["string_literal_expression", "interpolated_string_expression"],
     },
+    # Haskell has no classes in the OO sense; the closest analogue to a
+    # "type-level declaration" is data/newtype/type/class/instance, so those
+    # carry the Class label. Note `type_synomym` — the typo is in the grammar.
+    "haskell": {
+        "class": ["data_type", "newtype", "type_synomym", "class", "instance"],
+        # `function` covers equations with arguments; `bind` covers zero-arg
+        # definitions (`main = do ...`, CAFs) which would otherwise be missed.
+        "function": ["function", "bind"],
+        # Local `let`/`where` bindings nest, so they push FQN context —
+        # otherwise every `go`/`xs` in a module collides on one FQN.
+        "scope": ["function", "bind"],
+        # A type signature's `a -> f a` is itself a node of type `function`;
+        # walking into signatures would mint phantom functions and calls.
+        "skip": ["signature"],
+        "import": ["import"],
+        "call": ["apply"],
+        "decorator": [],  # Haskell has pragmas, not decorators
+        "variable": ["signature"],
+        "string": ["string"],
+    },
+    # Nix has no classes and no import statement. The unit of definition is
+    # `binding` (attrpath = expression); a path literal is the real file-level
+    # dependency signal, so it stands in for "import".
+    "nix": {
+        "class": [],
+        "function": ["binding"],
+        "scope": ["binding"],  # bindings nest, so they push FQN context
+        "import": ["path_expression"],
+        "call": ["apply_expression"],
+        "decorator": [],
+        "variable": ["binding"],
+        "string": ["string_expression"],
+    },
 }
 
 # ── Endpoint detection patterns ──────────────────────────────────────────────
@@ -139,6 +174,11 @@ ENDPOINT_PATTERNS: dict[str, list[str]] = {
         "[HttpGet", "[HttpPost", "[HttpPut", "[HttpDelete", "[HttpPatch",
         "[Route",
     ],
+    # Haskell web routes are type-level (servant) or DSL calls (scotty/yesod),
+    # not decorators — _find_decorators returns [] here, so any pattern listed
+    # would be dead code. Left empty deliberately.
+    "haskell": [],
+    "nix": [],
 }
 
 # ── DB model detection patterns ──────────────────────────────────────────────
@@ -152,6 +192,10 @@ DB_MODEL_PATTERNS: dict[str, list[str]] = {
     "php": ["Model", "Entity", "HasFactory"],
     "dart": ["@Entity", "@Table"],
     "csharp": ["DbContext", "[Table", "EntityTypeConfiguration"],
+    # Matched against node text, so these work without decorators. Kept
+    # conservative — each is a strong signal a type maps to a table.
+    "haskell": ["PersistEntity", "ToRow", "FromRow"],
+    "nix": [],
 }
 
 # ── Directories to skip during indexing ──────────────────────────────────────
@@ -161,4 +205,6 @@ SKIP_DIRS: set[str] = {
     "Pods", ".gradle", "DerivedData", "bin", "obj", ".dart_tool",
     ".pub-cache", "packages", ".next", ".nuxt", "out", "coverage",
     ".venv", "venv", "env", ".env",
+    # Haskell / Nix build output — dist-newstyle in particular is huge
+    "dist-newstyle", ".stack-work", "result", ".direnv",
 }

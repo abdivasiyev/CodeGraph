@@ -32,10 +32,23 @@ def _node_text(node, source: bytes) -> str:
 
 def _find_name(node, source: bytes) -> str:
     """Extract the name identifier from a tree-sitter node."""
+    # `instance Container []` shares its head name with `class Container`, so
+    # without the instance head both collapse onto one FQN — as would every
+    # other instance of the same class.
+    if node.type == "instance":
+        head = node.child_by_field_name("name")
+        if head:
+            base = _node_text(head, source)
+            pats = node.child_by_field_name("patterns")
+            return f"{base} {_node_text(pats, source)}".strip() if pats else base
     # Try common child field names
-    for field_name in ("name", "declarator", "pattern"):
+    for field_name in ("name", "declarator", "pattern", "attrpath"):
         child = node.child_by_field_name(field_name)
         if child:
+            # Nix attrpaths are dotted (`services.nginx`); the whole path is
+            # the name, so don't fall through to the first-identifier scan.
+            if child.type == "attrpath":
+                return _node_text(child, source)
             if child.type == "identifier" or child.type == "type_identifier":
                 return _node_text(child, source)
             # Nested — e.g. typed_pattern → identifier
@@ -64,6 +77,16 @@ def _find_name(node, source: bytes) -> str:
                     return _node_text(sub, source)
 
     return ""
+
+
+def _def_kind(node, lang: str, is_method: bool) -> str:
+    """Classify a definition node into a `kind` property."""
+    if lang == "nix":
+        # A Nix binding is a function only when its value is a lambda;
+        # everything else is a plain attribute value.
+        expr = node.child_by_field_name("expression")
+        return "function" if expr and expr.type == "function_expression" else "value"
+    return "method" if is_method else "function"
 
 
 def _find_params(node, source: bytes) -> str:
@@ -220,13 +243,30 @@ def parse_file(file_path: str, repo: str, source: bytes | None = None) -> FilePa
 
     # Stack to track parent context for FQN building
     # Each entry: (tree-sitter node id, fqn_prefix)
-    class_stack: list[tuple[int, str]] = []
+    class_stack: list[tuple[int, str, str]] = []
 
     def _current_prefix() -> str:
         return class_stack[-1][1] if class_stack else file_fqn
 
+    def _in_class_scope() -> bool:
+        """True when the innermost enclosing scope is a class-like node."""
+        return bool(class_stack) and class_stack[-1][2] in mapping.get("class", [])
+
     def _walk(node):
         ntype = node.type
+
+        # Anonymous tokens can share a declaration's type name (in Haskell the
+        # literal `newtype`/`class`/`instance` keywords do), so only named
+        # nodes may match a mapping entry.
+        if not node.is_named:
+            for child in node.children:
+                _walk(child)
+            return
+
+        # Subtrees that carry no runtime meaning (Haskell type signatures,
+        # where `a -> f a` is itself a node of type `function`).
+        if ntype in mapping.get("skip", []):
+            return
 
         # ── Classes / Structs / Interfaces ───────────────────────────────
         if ntype in mapping.get("class", []):
@@ -276,7 +316,7 @@ def parse_file(file_path: str, repo: str, source: bytes | None = None) -> FilePa
             # Extract superclass / implements
             _extract_inheritance(node, source, lang, fqn, result)
 
-            class_stack.append((node.id, fqn))
+            class_stack.append((node.id, fqn, ntype))
             for child in node.children:
                 _walk(child)
             class_stack.pop()
@@ -290,7 +330,7 @@ def parse_file(file_path: str, repo: str, source: bytes | None = None) -> FilePa
             fqn = _build_fqn(_current_prefix(), name)
             decorators = _find_decorators(node, source, lang)
             params = _find_params(node, source)
-            is_method = bool(class_stack)
+            is_method = _in_class_scope()
 
             code_node = CodeNode(
                 fqn=fqn, name=name, label="Function",
@@ -299,7 +339,7 @@ def parse_file(file_path: str, repo: str, source: bytes | None = None) -> FilePa
                 end_line=node.end_point[0] + 1,
                 language=lang, repo=repo,
                 properties={
-                    "kind": "method" if is_method else "function",
+                    "kind": _def_kind(node, lang, is_method),
                     "is_async": _is_async(node, source),
                     "params": params,
                     "signature": f"{name}({params})",
@@ -332,9 +372,16 @@ def parse_file(file_path: str, repo: str, source: bytes | None = None) -> FilePa
                     from_fqn=ep_fqn, to_fqn=fqn, rel_type="HANDLED_BY",
                 ))
 
-            # Walk body for calls
-            for child in node.children:
-                _walk(child)
+            # Walk body for calls. Some languages nest definitions inside
+            # definitions (Nix attrsets), so those push FQN context first.
+            if ntype in mapping.get("scope", []):
+                class_stack.append((node.id, fqn, ntype))
+                for child in node.children:
+                    _walk(child)
+                class_stack.pop()
+            else:
+                for child in node.children:
+                    _walk(child)
             return
 
         # ── Imports ──────────────────────────────────────────────────────
@@ -411,7 +458,7 @@ def _extract_docstring(node, source: bytes, lang: str) -> str:
     """Extract docstring/comment from the node or preceding sibling."""
     # Check preceding sibling for comment
     prev = node.prev_named_sibling
-    if prev and prev.type in ("comment", "block_comment", "line_comment", "doc_comment"):
+    if prev and prev.type in ("comment", "block_comment", "line_comment", "doc_comment", "haddock"):
         doc = _node_text(prev, source).strip()
         return doc[:500]
 
