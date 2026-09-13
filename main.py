@@ -66,18 +66,23 @@ async def query_code(cypher: str) -> str:
     """Execute a Cypher query against the code knowledge graph.
 
     The graph contains nodes: Repository, Service, File, Module, Class, Function,
-    Variable, Endpoint, DatabaseTable, Event, ExternalAPI, BusinessRule.
+    Variable, Endpoint, DatabaseTable, Event, ExternalAPI, BusinessRule,
+    PullRequest.
 
     Relationships: CONTAINS_FILE, DEFINES, CONTAINS, HAS_METHOD, HAS_FIELD,
     EXTENDS, IMPLEMENTS, CALLS, CALLS_EXTERNAL, EXPOSES, HANDLED_BY,
-    READS_FROM, WRITES_TO, PUBLISHES, SUBSCRIBES_TO, IMPORTS.
+    READS_FROM, WRITES_TO, PUBLISHES, SUBSCRIBES_TO, IMPORTS, TOUCHED_FILE.
 
-    All nodes have: fqn, name, file_path, start_line, end_line, language, repo.
+    Code nodes have: fqn, name, file_path, start_line, end_line, language, repo.
+    PullRequest nodes have: id, number, title, state, url, repo, author,
+    created_at, merged_at — and link to the files they changed via
+    (:PullRequest)-[:TOUCHED_FILE]->(:File).
 
     Example queries:
     - "MATCH (c:Class) WHERE c.repo = 'myapp' RETURN c.name, c.file_path LIMIT 20"
     - "MATCH (f:Function)-[:CALLS]->(g:Function) RETURN f.name, g.name LIMIT 20"
     - "MATCH (ep:Endpoint) RETURN ep.name, ep.path, ep.http_method"
+    - "MATCH (pr:PullRequest)-[:TOUCHED_FILE]->(f:File) RETURN pr.number, f.file_path LIMIT 10"
 
     Args:
         cypher: A Cypher query string.

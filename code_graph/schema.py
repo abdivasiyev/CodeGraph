@@ -38,6 +38,43 @@ class CodeNode:
 
 
 @dataclass
+class PullRequestNode:
+    """A pull request, linked to the File nodes it touched.
+
+    Kept separate from CodeNode on purpose: fqn/file_path/start_line/language
+    are meaningless for a PR, and folding them in would pollute the code-node
+    indexes and the stats headings. The unique key is the Forgejo internal id.
+    """
+
+    id: int  # Forgejo internal id — unique merge key
+    number: int
+    title: str
+    state: str  # "open" | "closed"
+    url: str
+    repo: str  # graph_repo — matches File.repo
+    author: str | None = None
+    created_at: str | None = None
+    merged_at: str | None = None
+
+    def to_dict(self) -> dict:
+        # Drop None-valued keys: `SET pr += item` treats a null in the map as
+        # "remove this property", so writing {author: null} would strip an
+        # author set on an earlier run. Omitting the key leaves it untouched.
+        d = {
+            "id": self.id,
+            "number": self.number,
+            "title": self.title,
+            "state": self.state,
+            "url": self.url,
+            "repo": self.repo,
+            "author": self.author,
+            "created_at": self.created_at,
+            "merged_at": self.merged_at,
+        }
+        return {k: v for k, v in d.items() if v is not None}
+
+
+@dataclass
 class CodeRelationship:
     """A directed relationship between two code nodes."""
 

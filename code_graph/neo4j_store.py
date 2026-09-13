@@ -10,7 +10,7 @@ from typing import Any
 from neo4j import AsyncGraphDatabase
 from neo4j.exceptions import TransientError
 
-from .schema import CodeNode, CodeRelationship
+from .schema import CodeNode, CodeRelationship, PullRequestNode
 
 log = logging.getLogger("code_graph.neo4j")
 
@@ -39,6 +39,11 @@ NODE_LABELS = [
     "Variable", "Endpoint", "DatabaseTable", "Event", "ExternalAPI", "BusinessRule",
 ]
 
+# Labels indexed and counted, but NOT part of the code-node pipeline. They are
+# kept out of NODE_LABELS so _ensure_indexes does not build fqn/name/file_path
+# indexes that are meaningless for them; they get their own indexes instead.
+EXTRA_LABELS = ["PullRequest"]
+
 
 class Neo4jStore:
     """Async wrapper around the Neo4j Python driver."""
@@ -52,6 +57,7 @@ class Neo4jStore:
     async def connect(self):
         self._driver = AsyncGraphDatabase.driver(self._uri, auth=(self._user, self._password))
         await self._ensure_indexes()
+        await self._ensure_pr_indexes()
         log.info("Connected to Neo4j at %s", self._uri)
 
     async def close(self):
@@ -76,6 +82,18 @@ class Neo4jStore:
                 await session.run(
                     f"CREATE INDEX IF NOT EXISTS FOR (n:{label}) ON (n.repo)"
                 )
+
+    async def _ensure_pr_indexes(self):
+        """Indexes for PullRequest nodes — id is the merge key, repo scopes
+        lookups. Separate from _ensure_indexes because PRs share none of the
+        code-node properties."""
+        async with self._driver.session() as session:
+            await session.run(
+                "CREATE INDEX IF NOT EXISTS FOR (n:PullRequest) ON (n.id)"
+            )
+            await session.run(
+                "CREATE INDEX IF NOT EXISTS FOR (n:PullRequest) ON (n.repo)"
+            )
 
     async def upsert_nodes(self, nodes: list[CodeNode]):
         """Batch upsert nodes using UNWIND + MERGE."""
@@ -130,6 +148,63 @@ class Neo4jStore:
         await _retry_on_deadlock(_do, "upsert_relationships")
         log.info("Upserted %d relationships across %d types", len(rels), len(by_type))
 
+    async def upsert_pull_requests(self, prs: list[PullRequestNode]):
+        """Batch upsert PullRequest nodes, merged on the Forgejo id."""
+        if not prs:
+            return
+        items = [pr.to_dict() for pr in prs]
+
+        async def _do():
+            async with self._driver.session() as session:
+                await session.run(
+                    """
+                    UNWIND $items AS item
+                    MERGE (pr:PullRequest {id: item.id})
+                    SET pr += item
+                    """,
+                    items=items,
+                )
+
+        await _retry_on_deadlock(_do, "upsert_pull_requests")
+        log.info("Upserted %d pull requests", len(prs))
+
+    async def link_pr_files(self, pr_id: int, graph_repo: str, file_paths: list[str]) -> int:
+        """Point a PR at the File nodes it touched, returning how many matched.
+
+        Stale edges are cleared first, so a re-run reflects the PR's CURRENT
+        file set (a rebase or force-push changes it) rather than accumulating
+        every file it ever touched.
+
+        The files are MATCHed, never MERGEd: a path with no indexed File node is
+        skipped. (upsert_relationships MERGEs its target and so synthesises
+        dangling placeholder nodes — exactly what must not happen here.) The
+        gap between len(file_paths) and the returned count is the signal that a
+        graph_repo mismatch left a PR with no edges.
+        """
+
+        async def _do():
+            async with self._driver.session() as session:
+                await session.run(
+                    "MATCH (pr:PullRequest {id: $pr_id})-[r:TOUCHED_FILE]->() DELETE r",
+                    pr_id=pr_id,
+                )
+                if not file_paths:
+                    return 0
+                result = await session.run(
+                    """
+                    UNWIND $paths AS p
+                    MATCH (pr:PullRequest {id: $pr_id})
+                    MATCH (f:File {repo: $repo, file_path: p})
+                    MERGE (pr)-[:TOUCHED_FILE]->(f)
+                    RETURN count(*) AS linked
+                    """,
+                    pr_id=pr_id, repo=graph_repo, paths=file_paths,
+                )
+                record = await result.single()
+                return record["linked"] if record else 0
+
+        return await _retry_on_deadlock(_do, f"link_pr_files({pr_id})")
+
     async def clear_file(self, file_path: str, repo: str):
         """Delete all nodes (and their relationships) originating from a specific file."""
         async def _do():
@@ -170,7 +245,7 @@ class Neo4jStore:
                 "RETURN label"
             )
             # Simpler approach:
-            for label in NODE_LABELS:
+            for label in NODE_LABELS + EXTRA_LABELS:
                 result = await session.run(f"MATCH (n:{label}) RETURN count(n) AS cnt")
                 record = await result.single()
                 if record:

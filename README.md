@@ -8,9 +8,9 @@ Documentation gets outdated. Code doesn't. CodeGraph lets you query business log
 
 ## What it extracts
 
-**12 node types**: Repository, Service, File, Module, Class, Function, Variable, Endpoint, DatabaseTable, Event, ExternalAPI, BusinessRule
+**13 node types**: Repository, Service, File, Module, Class, Function, Variable, Endpoint, DatabaseTable, Event, ExternalAPI, BusinessRule, PullRequest
 
-**15 relationship types**: CONTAINS_FILE, DEFINES, CONTAINS, HAS_METHOD, HAS_FIELD, EXTENDS, IMPLEMENTS, CALLS, CALLS_EXTERNAL, EXPOSES, HANDLED_BY, READS_FROM, WRITES_TO, PUBLISHES, SUBSCRIBES_TO, IMPORTS
+**16 relationship types**: CONTAINS_FILE, DEFINES, CONTAINS, HAS_METHOD, HAS_FIELD, EXTENDS, IMPLEMENTS, CALLS, CALLS_EXTERNAL, EXPOSES, HANDLED_BY, READS_FROM, WRITES_TO, PUBLISHES, SUBSCRIBES_TO, IMPORTS, TOUCHED_FILE
 
 ## Supported languages
 
@@ -66,6 +66,31 @@ uv run reindex.py
 ```
 
 Re-indexes every previously indexed repo (incremental).
+
+### Index pull requests (Forgejo)
+
+Links each PR to the `File` nodes it touched, in the same graph. Run *after*
+`main.py index` so the `File` nodes exist.
+
+```bash
+export FORGEJO_URL=http://127.0.0.1:3000
+export FORGEJO_TOKEN=<token>
+uv run index_prs.py --repo owner/name --state all
+```
+
+`--state` is `all` (default), `open`, or `closed`. PRs link to `File` nodes by
+`File.repo`; `graph_repo` defaults to the full `owner/name` of `--repo` (how
+repos are indexed here) and the indexer warns if no `File` nodes exist for it —
+pass `--graph-repo NAME` to override when a repo was indexed under a different
+name. Then query the links:
+
+```cypher
+MATCH (pr:PullRequest)-[:TOUCHED_FILE]->(f:File)
+RETURN pr.number, f.file_path LIMIT 10
+```
+
+Re-running is idempotent: PRs merge on their id, and each PR's `TOUCHED_FILE`
+edges are rebuilt from its current file set.
 
 ### MCP server (Claude Desktop)
 
